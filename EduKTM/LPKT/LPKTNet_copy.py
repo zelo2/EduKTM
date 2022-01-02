@@ -1,146 +1,94 @@
 # coding: utf-8
-# 2021/12/22 @ zelo2
+# 2021/8/17 @ sone
 
 import torch
 from torch import nn
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 class LPKTNet(nn.Module):
-    def __init__(self, exercise_num, skill_num, stu_num, ans_time_num, interval_time_num, d_k, d_a, d_e, q_matrix):
-        '''
-        :param exercise_num: 试题数量
-        :param skill_num: 知识点数量
-        :param stu_num: 学生数量
-        :param ans_time_num: 做答时间数量
-        :param interval_time_num: 相邻Learning cell之间的interval time的数量
-        :param d_a: Dimension of the answer (0-All Zero, 1-All One)
-        :param d_e: Dimension of the exercise
-        :param d_k: Dimension of the skill
-        '''
+    def __init__(self, n_at, n_it, n_exercise, n_question, d_a, d_e, d_k, q_matrix, dropout=0.2):
         super(LPKTNet, self).__init__()
         self.d_k = d_k
         self.d_a = d_a
         self.d_e = d_e
-        self.exercise_num = exercise_num
-        self.skill_num = skill_num
-        self.stu_num = stu_num
-        self.ans_time_num = ans_time_num
-        self.interval_time_num = interval_time_num
-        self.tanh = nn.Tanh()
-        self.sigmoid = nn.Sigmoid()
-
-
-        self.gamma = 0.03  # for those values of the Q-matrix are zero
         self.q_matrix = q_matrix
-        self.q_matrix[self.q_matrix == 0] = self.gamma  # Enhanced Q-matrix
+        self.n_question = n_question
 
-        '''Dropout layer'''
-        self.dropout = nn.Dropout(0.2)  # follow the original paper
+        self.at_embed = nn.Embedding(n_at + 10, d_k)
+        torch.nn.init.xavier_uniform_(self.at_embed.weight)
+        self.it_embed = nn.Embedding(n_it + 10, d_k)
+        torch.nn.init.xavier_uniform_(self.it_embed.weight)
+        self.e_embed = nn.Embedding(n_exercise + 10, d_k)
+        torch.nn.init.xavier_uniform_(self.e_embed.weight)
 
-        '''Exercise Embedding'''
-        self.exercise_embed = nn.Embedding(self.exercise_num, self.d_e)
+        self.linear_1 = nn.Linear(d_a + d_e + d_k, d_k)
+        torch.nn.init.xavier_uniform_(self.linear_1.weight)
+        self.linear_2 = nn.Linear(4 * d_k, d_k)
+        torch.nn.init.xavier_uniform_(self.linear_2.weight)
+        self.linear_3 = nn.Linear(4 * d_k, d_k)
+        torch.nn.init.xavier_uniform_(self.linear_3.weight)
+        self.linear_4 = nn.Linear(3 * d_k, d_k)
+        torch.nn.init.xavier_uniform_(self.linear_4.weight)
+        self.linear_5 = nn.Linear(d_e + d_k, d_k)
+        torch.nn.init.xavier_uniform_(self.linear_5.weight)
 
+        self.tanh = nn.Tanh()
+        self.sig = nn.Sigmoid()
+        self.dropout = nn.Dropout(dropout)
 
-        '''Time Embedding'''
-        self.ans_time_embed = nn.Embedding(self.ans_time_num, self.d_k)
-        self.interval_time_embed = nn.Embedding(self.interval_time_num, self.d_k)
+    def forward(self, e_data, at_data, a_data, it_data):
+        batch_size, seq_len = e_data.size(0), e_data.size(1)
+        e_embed_data = self.e_embed(e_data)
+        at_embed_data = self.at_embed(at_data)
+        it_embed_data = self.it_embed(it_data)
+        a_data = a_data.view(-1, 1).repeat(1, self.d_a).view(batch_size, -1, self.d_a)
+        h_pre = nn.init.xavier_uniform_(torch.zeros(self.n_question + 1, self.d_k)).repeat(batch_size, 1, 1).to(device)
+        h_tilde_pre = None
+        all_learning = self.linear_1(torch.cat((e_embed_data, at_embed_data, a_data), 2))
+        learning_pre = torch.zeros(batch_size, self.d_k).to(device)
 
+        pred = torch.zeros(batch_size, seq_len).to(device)
 
-        # '''Knowledge Embedding'''
-        # self.stu_mastery_embed = nn.Embedding(self.stu_num, self.d_k)
+        for t in range(0, seq_len - 1):
+            e = e_data[:, t]
+            # q_e: (bs, 1, n_skill)
+            q_e = self.q_matrix[e].view(batch_size, 1, -1)
+            it = it_embed_data[:, t]
 
+            # Learning Module
+            if h_tilde_pre is None:
+                # (bs, 1, n_skill) * (bs, n_question+1, n_skill) ?
+                h_tilde_pre = q_e.bmm(h_pre).view(batch_size, self.d_k)
+            learning = all_learning[:, t]
+            learning_gain = self.linear_2(torch.cat((learning_pre, it, learning, h_tilde_pre), 1))
+            learning_gain = self.tanh(learning_gain)
+            gamma_l = self.linear_3(torch.cat((learning_pre, it, learning, h_tilde_pre), 1))
+            gamma_l = self.sig(gamma_l)
+            LG = gamma_l * ((learning_gain + 1) / 2)
+            LG_tilde = self.dropout(q_e.transpose(1, 2).bmm(LG.view(batch_size, 1, -1)))
 
-        '''MLP Construction'''
-        # Learning gain Embedding
-        # 这里的Embedding的input没有加入试题所考察的知识点向量 存疑？
-        self.learning_gain_embed_layer = nn.Linear(self.d_e+self.d_k+self.d_a, self.d_k)  # input = exercise + answer time+ answer
-        torch.nn.init.xavier_normal(self.learning_gain_embed_layer.weight)  # follow the original paper
+            # Forgetting Module
+            # h_pre: (bs, n_skill, d_k)
+            # LG: (bs, d_k)
+            # it: (bs, d_k)
+            n_skill = LG_tilde.size(1)
+            gamma_f = self.sig(self.linear_4(torch.cat((
+                h_pre,
+                LG.repeat(1, n_skill).view(batch_size, -1, self.d_k),
+                it.repeat(1, n_skill).view(batch_size, -1, self.d_k)
+            ), 2)))
+            h = LG_tilde + gamma_f * h_pre
 
-        # Learning Obtain Layer
-        self.learning_layer = nn.Linear(self.d_k * 4, self.d_k)  # input = l(t-1) + interval time + l(t) + h(t-1)
-        torch.nn.init.xavier_normal(self.learning_layer.weight)
+            # Predicting Module
+            h_tilde = self.q_matrix[e_data[:, t + 1]].view(batch_size, 1, -1).bmm(h).view(batch_size, self.d_k)
+            y = self.sig(self.linear_5(torch.cat((e_embed_data[:, t + 1], h_tilde), 1))).sum(1) / self.d_k
+            pred[:, t + 1] = y
 
-        # Learning Judge Layer
-        self.learning_gate = nn.Linear(self.d_k * 4, self.d_k)  # input = l(t-1) + interval time + l(t) + h(t-1)
-        torch.nn.init.xavier_normal(self.learning_gate.weight)
+            # prepare for next prediction
+            learning_pre = learning
+            h_pre = h
+            h_tilde_pre = h_tilde
 
-        # Forgetting Layer
-        self.forgetting_gate = nn.Linear(self.d_k * 3, self.d_k)  # input = h(t-1) + learning gain (t) + interval time
-        torch.nn.init.xavier_normal(self.forgetting_gate.weight)
-
-        # Predicting Layer
-        self.predicting_layer = nn.Linear(self.d_k * 2, self.d_k)  # input = exercise (t+1) + h (t)
-
-
-    def forward(self, exercise_id, skill_id, stu_id, answer_value, ans_time, interval_time):
-        '''
-        :param exercise_id: 试题id序列  batch_size * sequence
-        :param skill_id: 知识点id序列
-        :param stu_id: 学生id
-        :param answer_value: 试题得分序列
-        :param ans_time: 回答时间序列
-        :param interval_time: 两次回答间隔时间序列 长度=前面的序列长度-1
-        :return: Prediction
-        E.g: stu_id-0
-             exercise_id- 1, 2, 3, 4, 6
-             skill_id- 1, 1, 1, 4, 5, 5
-             answer_value- 1, 1, 0, 0, 0, 0
-             ans_time- 5, 10, 15, 5, 20
-             interval_time- 1000, 20000, 5000, 400
-        '''
-
-        batch_size, sequence_len = exercise_id.size(0), exercise_id.size(1)
-
-        '''Supposing the units of the answer time and the interval time are both Second (s)'''
-        interval_time /= 60  # discretized by minutes
-        ans_time /= 1  # discretized by seconds
-
-        '''Obtain the Embedding of each element'''
-        exercise = self.exercise_embed(exercise_id)  # batch_size * sequence * d_e
-        # stu_mastery = self.stu_mastery_embed(stu_id)  # 1 x skill_num
-        ans_time = self.ans_time_embed(ans_time)  # batch_size * sequence * d_k
-        interval_time = self.interval_time_embed(interval_time)  # batch_size * sequence * d_k
-
-        '''Preprocess the answer'''
-        answer = answer_value.view(-1, 1)  # (batch_size * sequence) * 1
-        answer = answer.repeat(1, self.d_a)  # (batch_size * sequence) * d_a
-        answer = answer.view(batch_size, -1, self.d_a)  # batch_size * sequence * d_a
-
-        '''Initial the learning gain'''
-        # 使用torch.cat((A,B),dim)时，除拼接维数dim数值可不同外其余维数数值需相同，方能对齐
-        learning_gain = self.learning_gain_embed_layer(torch.cat((exercise, ans_time, answer), 2))  # batch_size * sequence * (d_e + d_k + d_a)
-
-        '''Initial the students' mastery'''
-        h_pre = None  # h_t-1
-        h = torch.nn.init.xavier_uniform_(torch.zeros(self.exercise_num, self.d_k))  # exercise  * knowledge
-        h = h.repeat(batch_size, 1, 1).to(device)  # batch_size * exercise * knowledge
-
-
-
-        '''Batch size train'''
-        # 每个作答序列，我们都需要两两拿出来进行训练
-        for echo in range(sequence_len - 1):
-            exercise_vector = exercise[:, echo]  # batch_size * d_e
-            answer_time_vector = ans_time[:, echo]  # batch_size * d_k
-            answer_vector = ans_time[:, echo]  # batch_size * d_a
-
-
-            temp_exercise_id = exercise_id[:, echo]  # batch_size
-            knowledge_vecor = self.q_matrix[temp_exercise_id]  # batch_size * knowledge
-            knowledge_vecor = knowledge_vecor.view(batch_size, 1, -1)  # 为后续的矩阵相乘进行reshape
-
-            if h_pre is None:
-                # h_pre = h
-                h_pre = 0
-
-
-
-
-
-
-        return 0
-
-
-a = torch.ones([3, 2, 3])
-b = torch.tensor([0, 1])
-print(a[b].size())
+        return pred
