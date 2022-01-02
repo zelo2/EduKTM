@@ -46,8 +46,8 @@ class LPKTNet(nn.Module):
         self.interval_time_embed = nn.Embedding(self.interval_time_num, self.d_k)
 
 
-        '''Knowledge Embedding'''
-        self.stu_mastery_embed = nn.Embedding(self.stu_num, self.d_k)
+        # '''Knowledge Embedding'''
+        # self.stu_mastery_embed = nn.Embedding(self.stu_num, self.d_k)
 
 
         '''MLP Construction'''
@@ -74,17 +74,17 @@ class LPKTNet(nn.Module):
 
     def forward(self, exercise_id, skill_id, stu_id, answer_value, ans_time, interval_time):
         '''
-        :param exercise_id: 试题id序列
+        :param exercise_id: 试题id序列  batch_size * sequence
         :param skill_id: 知识点id序列
         :param stu_id: 学生id
-        :param answer: 试题得分序列
+        :param answer_value: 试题得分序列
         :param ans_time: 回答时间序列
         :param interval_time: 两次回答间隔时间序列 长度=前面的序列长度-1
         :return: Prediction
         E.g: stu_id-0
              exercise_id- 1, 2, 3, 4, 6
              skill_id- 1, 1, 1, 4, 5, 5
-             answer- 1, 1, 0, 0, 0, 0
+             answer_value- 1, 1, 0, 0, 0, 0
              ans_time- 5, 10, 15, 5, 20
              interval_time- 1000, 20000, 5000, 400
         '''
@@ -92,23 +92,30 @@ class LPKTNet(nn.Module):
         batch_size, sequence_len = exercise_id.size(0), exercise_id.size(1)
 
         '''Supposing the units of the answer time and the interval time are both Second (s)'''
-        interval_time /= 60  # discretize by minutes
-        ans_time /= 1  # discretize by seconds
+        interval_time /= 60  # discretized by minutes
+        ans_time /= 1  # discretized by seconds
 
         '''Obtain the Embedding of each element'''
         exercise = self.exercise_embed(exercise_id)  # batch_size * sequence * d_e
-        stu_mastery = self.stu_mastery_embed(stu_id)  # 1 x skill_num
+        # stu_mastery = self.stu_mastery_embed(stu_id)  # 1 x skill_num
         ans_time = self.ans_time_embed(ans_time)  # batch_size * sequence * d_k
         interval_time = self.interval_time_embed(interval_time)  # batch_size * sequence * d_k
 
-        # process the answer
+        '''Preprocess the answer'''
         answer = answer_value.view(-1, 1)  # (batch_size * sequence) * 1
         answer = answer.repeat(1, self.d_a)  # (batch_size * sequence) * d_a
         answer = answer.view(batch_size, -1, self.d_a)  # batch_size * sequence * d_a
 
-        # initial the learning gain
+        '''Initial the learning gain'''
         # 使用torch.cat((A,B),dim)时，除拼接维数dim数值可不同外其余维数数值需相同，方能对齐
-        learning_gain = self.learning_gain_embed_layer(torch.cat((exercise, ans_time, answer), 2))
+        learning_gain = self.learning_gain_embed_layer(torch.cat((exercise, ans_time, answer), 2))  # batch_size * sequence * (d_e + d_k + d_a)
+
+        '''Initial the students' mastery'''
+        h_pre = None  # h_t-1
+        h = torch.nn.init.xavier_uniform_(torch.zeros(self.exercise_num, self.d_k))  # exercise  * knowledge
+        h = h.repeat(batch_size, 1, 1).to(device)  # batch_size * exercise * knowledge
+
+
 
         '''Batch size train'''
         # 每个作答序列，我们都需要两两拿出来进行训练
@@ -118,8 +125,22 @@ class LPKTNet(nn.Module):
             answer_vector = ans_time[:, echo]  # batch_size * d_a
 
 
+            temp_exercise_id = exercise_id[:, echo]  # batch_size
+            knowledge_vecor = self.q_matrix[temp_exercise_id]  # batch_size * knowledge
+            knowledge_vecor = knowledge_vecor.view(batch_size, 1, -1)  # 为后续的矩阵相乘进行reshape
+
+            if h_pre is None:
+                # h_pre = h
+                h_pre = 0
+
+
 
 
 
 
         return 0
+
+
+a = torch.ones([3, 2, 3])
+b = torch.tensor([0, 1])
+print(a[b].size())
